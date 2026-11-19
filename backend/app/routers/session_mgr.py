@@ -94,10 +94,46 @@ def run_action(entry_id: int, payload: ActionPayload) -> ActionResult:
 
 @router.post("/{entry_id}/record")
 def record_request(entry_id: int, payload: dict[str, object]) -> dict:
-    """记录会话请求。"""
+    """记录会话请求。代理编号与归属依据从代理调度结果读取，未授权跨域不落日志。"""
     url = str(payload.get("url") or "")
     latency = float(payload.get("latency", 0))
-    return service.record_request(entry_id, url, latency)
+    writer = str(payload.get("writer") or "session_mgr")
+    return service.record_request(entry_id, url, latency, writer=writer)
+
+
+@router.get("/{entry_id}/dispatch")
+def get_dispatch(entry_id: int) -> dict:
+    """只读查看会话的代理调度结果（归属依据、代理编号、版本号）。"""
+    dispatch = service._dispatch_view(entry_id)
+    if dispatch is None:
+        return {"ok": False, "error": "该会话尚未生成代理调度结果"}
+    return {"ok": True, "dispatch": dispatch}
+
+
+@router.post("/{entry_id}/dispatch")
+def request_dispatch(entry_id: int, payload: dict[str, object]) -> dict:
+    """会话侧申请代理调度：本域优先；跨域必须显式带授权，版本冲突按先后仲裁。"""
+    result = service.request_dispatch(
+        entry_id,
+        cross_region=bool(payload.get("cross_region")),
+        authorization=payload.get("authorization") if isinstance(payload.get("authorization"), dict) else None,
+        expected_version=(
+            int(payload["expected_version"]) if str(payload.get("expected_version") or "").strip().isdigit()
+            else None
+        ),
+    )
+    return result
+
+
+@router.post("/{entry_id}/dispatch/write")
+def write_dispatch(entry_id: int, payload: dict[str, object]) -> dict:
+    """受控写入入口：只有代理池调度模块可以写；其他模块越权写入会被拒绝。"""
+    from app.services.proxy_pool import ProxyPoolService
+
+    writer = str(payload.get("writer") or "session_mgr")
+    body = dict(payload)
+    body["session_id"] = entry_id
+    return ProxyPoolService().write_dispatch_result(body, writer=writer)
 
 
 @router.post("/rotate")

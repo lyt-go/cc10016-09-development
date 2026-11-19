@@ -21,6 +21,8 @@ class Store:
             "dedup_bloom_filters": {},       # dedup_filter 布隆过滤器状态
             "format_pipelines": {},          # format_convert pipeline 运行状态
             "proxy_health_scores": {},       # proxy_pool 健康评分历史
+            "proxy_dispatch_results": {},    # proxy_pool 会话代理调度结果（受控共享）
+            "proxy_dispatch_conflicts": [],  # proxy_pool 调度结果版本冲突仲裁记录
             "session_request_logs": {},      # session_mgr 请求日志
             "retry_backoff_records": {},     # retry_policy 退避记录
             "anti_spider_trigger_log": [],   # anti_spider 触发日志
@@ -159,6 +161,13 @@ class Store:
     def module_names(self) -> list[str]:
         return sorted(self._tables)
 
+    def reset(self) -> None:
+        """重置为初始示例数据，供测试或运维复位使用。"""
+        fresh = Store()
+        self._tables = fresh._tables
+        self._pipeline_states = fresh._pipeline_states
+        self._relations = fresh._relations
+
     def rows(self, module: str) -> list[dict[str, Any]]:
         return self._tables.setdefault(module, [])
 
@@ -213,6 +222,30 @@ class Store:
                 continue
             result.append(r)
         return result
+
+    def remove_relations(self, relation_type: str, source_module: str | None = None,
+                         source_id: int | None = None, target_module: str | None = None,
+                         target_id: int | None = None) -> int:
+        """删除匹配的关系记录，返回删除条数；用于同一会话只保留一个有效绑定的场景。"""
+        rels = self._relations.get(relation_type, [])
+        keep = []
+        removed = 0
+        for r in rels:
+            matched = True
+            if source_module and r["source_module"] != source_module:
+                matched = False
+            if source_id is not None and r["source_id"] != source_id:
+                matched = False
+            if target_module and r["target_module"] != target_module:
+                matched = False
+            if target_id is not None and r["target_id"] != target_id:
+                matched = False
+            if matched:
+                removed += 1
+            else:
+                keep.append(r)
+        self._relations[relation_type] = keep
+        return removed
 
     def overview(self) -> dict[str, object]:
         modules: list[dict[str, object]] = []

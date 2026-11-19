@@ -65,6 +65,42 @@ def export_entries(
         headers={"Content-Disposition": 'attachment; filename="proxy_pool.csv"'})
 
 
+@router.get("/dispatch", response_model=dict)
+def list_dispatch_results() -> dict:
+    """受控共享：读取全部会话的代理调度结果（只读快照）。"""
+    return {"ok": True, "items": service.list_dispatch_results()}
+
+
+@router.get("/dispatch/conflicts", response_model=dict)
+def list_dispatch_conflicts() -> dict:
+    """版本冲突仲裁记录：谁在哪个版本上被拒、按什么规则仲裁。"""
+    from app.store import store
+
+    return {"ok": True, "items": store.pipeline_state("proxy_dispatch_conflicts") or []}
+
+
+@router.post("/dispatch", response_model=dict)
+def dispatch_session(payload: dict[str, object]) -> dict:
+    """为会话编排代理并生成调度结果；跨域必须带授权，版本冲突按先后仲裁。"""
+    session_id = payload.get("session_id")
+    if session_id is None:
+        return {"ok": False, "code": "bad_session", "message": "缺少 session_id"}
+    try:
+        sid = int(session_id)
+    except (TypeError, ValueError):
+        return {"ok": False, "code": "bad_session", "message": "session_id 必须是整数"}
+    return service.dispatch_for_session(
+        sid,
+        cross_region=bool(payload.get("cross_region")),
+        authorization=payload.get("authorization") if isinstance(payload.get("authorization"), dict) else None,
+        expected_version=(
+            int(payload["expected_version"]) if str(payload.get("expected_version") or "").strip().isdigit()
+            else None
+        ),
+        writer=str(payload.get("writer") or "proxy_pool"),
+    )
+
+
 @router.get("/{entry_id}", response_model=dict)
 def get_entry(entry_id: int) -> dict:
     """读取单条代理节点明细；不存在时给出可读的错误说明。"""

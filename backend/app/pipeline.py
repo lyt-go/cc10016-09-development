@@ -91,10 +91,10 @@ def run_execution_chain(schedule_id: int) -> dict[str, Any]:
         if missing:
             return {"ok": False, "stage": "session_creation", "error": missing}
 
-    # 选择代理
-    proxy = proxy_svc.select_proxy()
-    if proxy:
-        proxy_svc.record_request(proxy["id"], True, 150.0)
+    # 代理池按会话地域归属生成调度结果，会话只引用该结果
+    dispatch = proxy_svc.dispatch_for_session(sess["id"])
+    if dispatch.get("proxy_id"):
+        proxy_svc.record_request(dispatch["proxy_id"], True, 150.0)
 
     # 获取频次令牌
     rate_rels = store.get_relations("source_to_rate_limit", source_module="crawl_source", source_id=source_id)
@@ -107,7 +107,7 @@ def run_execution_chain(schedule_id: int) -> dict[str, Any]:
         "stage": "execution_ready",
         "schedule_id": schedule_id,
         "session_id": sess["id"],
-        "proxy_id": proxy["id"] if proxy else None,
+        "proxy_id": dispatch.get("proxy_id"),
         "token": token_result,
     }
 

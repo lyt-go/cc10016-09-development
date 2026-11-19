@@ -18,6 +18,27 @@ from typing import Any
 from app.store import store
 
 
+def _source_id_for_seed_code(seed_code: str) -> int:
+    """按种子编号找到所属采集源；优先走关系索引，其次按数字后缀匹配。"""
+    if not seed_code:
+        return 0
+    seed = store.find_by_field("seed_config", "种子编号", seed_code)
+    if seed is not None:
+        rels = store.get_relations("source_to_seed", target_module="seed_config", target_id=int(seed["id"]))
+        if rels:
+            return int(rels[0]["source_id"])
+    import re
+
+    match = re.search(r"(\d+)", seed_code)
+    if match:
+        suffix = match.group(1)
+        for src in store.rows("crawl_source"):
+            src_match = re.search(r"(\d+)", str(src.get("源标识") or ""))
+            if src_match and src_match.group(1) == suffix:
+                return int(src["id"])
+    return 0
+
+
 def chain_source_seed_parse_field(source_id: int) -> dict[str, Any]:
     """链路1: 采集源 -> 种子 -> 解析规则 -> 字段抽取。"""
     from app.services.crawl_source import CrawlSourceService
@@ -83,13 +104,8 @@ def chain_schedule_session_proxy_rate(schedule_id: int) -> dict[str, Any]:
     if not plan.get("ok"):
         return {"ok": False, "message": f"执行计划生成失败: {plan.get('error')}", "schedule_id": schedule_id}
 
-    # 获取关联源
-    source_id = 0
-    seed_code = str(schedule.get("关联种子") or "")
-    for src in store.rows("crawl_source"):
-        if seed_code.split("-")[1] if "-" in seed_code else "" in str(src.get("源标识") or ""):
-            source_id = int(src["id"])
-            break
+    # 获取关联源：经由 seed_config 的跨模块关系解析，避免按字符串前缀硬猜
+    source_id = _source_id_for_seed_code(str(schedule.get("关联种子") or ""))
 
     sess = sess_svc.rotate_session(source_id)
     if sess is None:
@@ -99,13 +115,13 @@ def chain_schedule_session_proxy_rate(schedule_id: int) -> dict[str, Any]:
             return {"ok": False, "message": f"会话创建失败: {missing}", "schedule_id": schedule_id}
 
     sess_id = int(sess["id"])
-    sess_svc.record_request(sess_id, f"/api/execute/{schedule_id}", 120.0)
 
-    proxy = proxy_svc.select_proxy()
-    proxy_id = int(proxy["id"]) if proxy else None
+    # 先由代理池按会话地域归属生成调度结果，再让会话引用该结果写请求日志。
+    dispatch = proxy_svc.dispatch_for_session(sess_id)
+    sess_svc.record_request(sess_id, f"/api/execute/{schedule_id}", 120.0)
+    proxy_id = dispatch.get("proxy_id")
     if proxy_id:
         proxy_svc.record_request(proxy_id, True, 120.0)
-        store.add_relation("session_to_proxy", "session_mgr", sess_id, "proxy_pool", proxy_id)
 
     rate_rels = store.get_relations("source_to_rate_limit", source_module="crawl_source", source_id=source_id)
     token_result: dict[str, Any] = {"allowed": True, "reason": "未绑定限流策略"}
@@ -118,6 +134,9 @@ def chain_schedule_session_proxy_rate(schedule_id: int) -> dict[str, Any]:
         "schedule_id": schedule_id,
         "session_id": sess_id,
         "proxy_id": proxy_id,
+        "proxy_scope": dispatch.get("scope"),
+        "affiliation": dispatch.get("affiliation"),
+        "dispatch_version": dispatch.get("version"),
         "token": token_result,
         "plan_batches": plan.get("plan", {}).get("batches"),
     }
@@ -269,12 +288,7 @@ def chain_monitor_schedule(schedule_id: int) -> dict[str, Any]:
     if schedule is None:
         return {"ok": False, "message": "采集编排不存在", "schedule_id": schedule_id}
 
-    source_id = 0
-    seed_code = str(schedule.get("关联种子") or "")
-    for src in store.rows("crawl_source"):
-        if seed_code.split("-")[1] if "-" in seed_code else "" in str(src.get("源标识") or ""):
-            source_id = int(src["id"])
-            break
+    source_id = _source_id_for_seed_code(str(schedule.get("关联种子") or ""))
 
     metrics = mon_svc.refresh_metrics(source_id)
     plan = sched_svc.generate_execution_plan(schedule_id)

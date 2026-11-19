@@ -68,6 +68,39 @@ npm run dev
 | 采集监控 | `crawl_monitor` | 监控指标 | 指标编号、关联源、成功率 |
 | 内容抽取 | `content_extract` | 提取任务 | 任务编号、来源页面、内容类型 |
 
+## 代理调度：会话地域归属
+
+代理池调度不再只看全局健康评分，而是先按会话归属编排：
+
+- **归属来源**：会话显式登记的 `归属地域`，否则取关联采集源的 `地区归属`；
+  「全国」源可在境内地域就近调度，但不会落到海外节点。
+- **双条件**：代理地域必须落在会话归属范围内，且健康状态可用（状态为「可用」、
+  成功率/延迟齐全、健康评分不低于阈值）。任一缺失都不分配。
+- **本域优先**：归属范围内存在健康可用代理时按评分取最高，不用跨域代理。
+- **跨域**：`cross_region=true` 时必须带 `授权编号 / 授权人 / 授权范围`，授权范围要覆盖
+  目标地域；调度结果会记录授权依据、原会话地域与越域原因。未授权跨域不写结果。
+- **版本仲裁**：每次调度结果带递增 `version`。提交方可以带 `expected_version`，
+  落后于当前版本时返回 `version_conflict` 并记录仲裁日志，已有结果不被覆盖。
+- **同源与只读**：调度结果只由 `proxy_pool` 写入（`proxy_dispatch_results`），
+  会话管理、采集编排等模块只读引用；越权写入返回 `forbidden_writer`。
+- **请求日志**：会话请求记录只能由会话管理写入，且必须引用调度结果中的代理编号；
+  未分配或跨域无授权的代理不会写进请求日志。同一会话只保留一个有效代理绑定。
+
+接口：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/proxy_pool/dispatch` | 生成/更新会话代理调度结果（跨域需授权，支持 `expected_version`） |
+| GET | `/api/proxy_pool/dispatch` | 只读列出调度结果 |
+| GET | `/api/proxy_pool/dispatch/conflicts` | 版本冲突仲裁记录 |
+| POST | `/api/session_mgr/{id}/dispatch` | 会话侧申请调度 |
+| GET | `/api/session_mgr/{id}/dispatch` | 只读查看该会话调度结果 |
+| POST | `/api/session_mgr/{id}/dispatch/write` | 受控写入入口，仅 `proxy_pool` 可写 |
+| POST | `/api/session_mgr/{id}/record` | 写请求日志（含代理编号与归属依据） |
+
+验收脚本：`cd backend && .venv/bin/python scripts/proxy_dispatch_acceptance.py`
+演示华东会话在本域低分代理与跨域高分代理之间的取舍、版本冲突与越权拒绝。
+
 ## 约定
 
 - 每个模块的前端页面在 `frontend/src/views/<模块>/index.vue`，后端接口在

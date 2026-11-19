@@ -1,4 +1,4 @@
-"""会话管理业务规则：会话超时轮转、Cookie摘要刷新、请求计数追踪。"""
+"""会话管理业务规则：会话超时轮转、Cookie摘要刷新、请求计数追踪、代理归属回写。"""
 from __future__ import annotations
 
 from typing import Any
@@ -11,6 +11,8 @@ REQUIRED_FIELDS = ["会话编号", "关联源"]
 STATUS_ORDER = ["草稿", "活跃", "已过期", "已失效"]
 ACTION_RULES = {"标记活跃": "活跃", "标记过期": "已过期", "标记失效": "已失效"}
 NEGATIVE_ACTIONS = ["标记失效"]
+# 会话管理是代理调度结果的读取方，不是写入方：这里只引用代理池给出的归属依据。
+DISPATCH_READER = "session_mgr"
 
 
 def _check_session_expiry(entry: dict[str, Any]) -> bool:
@@ -25,6 +27,12 @@ def _check_session_expiry(entry: dict[str, Any]) -> bool:
 
 
 class SessionMgrService:
+    def _dispatch_view(self, session_id: int) -> dict[str, Any] | None:
+        """只读拉取代理池调度结果，保持与代理池一侧同源。"""
+        from app.services.proxy_pool import ProxyPoolService
+
+        return ProxyPoolService().get_dispatch_result(session_id, reader=DISPATCH_READER)
+
     def list_entries(
         self,
         *,
@@ -50,6 +58,7 @@ class SessionMgrService:
             expired = _check_session_expiry(d)
             d["_expired"] = expired
             d["_request_log"] = logs.get(str(d["id"]), [])
+            d["_dispatch"] = self._dispatch_view(int(d["id"]))
             enriched.append(d)
         return enriched, total
 
@@ -61,6 +70,7 @@ class SessionMgrService:
         d["_expired"] = _check_session_expiry(d)
         logs = store.pipeline_state("session_request_logs") or {}
         d["_request_log"] = logs.get(str(entry_id), [])
+        d["_dispatch"] = self._dispatch_view(entry_id)
         return d
 
     def create_entry(self, values: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
@@ -75,15 +85,28 @@ class SessionMgrService:
         entry["abnormal"] = False
         entry["请求计数"] = "0"
         rows.append(entry)
-        # 绑定代理
-        proxy_id = values.get("绑定代理ID")
-        if proxy_id:
-            try:
-                pid = int(proxy_id)
-                store.add_relation("session_to_proxy", MODULE, entry["id"], "proxy_pool", pid)
-            except (ValueError, TypeError):
-                pass
+        # 代理绑定不在登记时直接落库：会话只能引用代理池调度结果（同源），
+        # 调用方可以显式申请一次调度，而不是自行拼一个 session_to_proxy 关系。
+        if values.get("绑定代理ID"):
+            dispatch = self.request_dispatch(entry["id"], cross_region=bool(values.get("跨域调度")))
+            entry["_dispatch"] = dispatch
         return entry, []
+
+    def request_dispatch(self, entry_id: int, *, cross_region: bool = False,
+                         authorization: dict[str, Any] | None = None,
+                         expected_version: int | None = None) -> dict[str, Any]:
+        """会话侧发起调度申请，真正写入仍由代理池调度一侧完成。"""
+        from app.services.proxy_pool import DISPATCH_OWNER, ProxyPoolService
+
+        if store.find(MODULE, entry_id) is None:
+            return {"ok": False, "code": "session_missing", "message": f"采集会话 {entry_id} 不存在或已归档"}
+        return ProxyPoolService().dispatch_for_session(
+            entry_id,
+            cross_region=cross_region,
+            authorization=authorization,
+            expected_version=expected_version,
+            writer=DISPATCH_OWNER,
+        )
 
     def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
         entry = store.find(MODULE, entry_id)
@@ -99,11 +122,41 @@ class SessionMgrService:
         entry["abnormal"] = action in NEGATIVE_ACTIONS
         return entry, f"采集会话已{action}"
 
-    def record_request(self, entry_id: int, url: str, latency_ms: float) -> dict[str, Any]:
-        """记录会话请求并更新计数。"""
+    def record_request(self, entry_id: int, url: str, latency_ms: float,
+                       *, writer: str = DISPATCH_READER) -> dict[str, Any]:
+        """记录会话请求并写入代理编号与归属依据。
+
+        代理编号只能来自代理池调度结果：未分配、或调度结果中的跨域代理没有授权时，
+        请求日志不落全量记录，返回拒绝原因。请求日志是会话管理的自有数据，
+        其他模块的写入同样按越权处理。
+        """
+        if writer != DISPATCH_READER:
+            return {
+                "ok": False,
+                "code": "forbidden_writer",
+                "message": f"会话请求记录只能由 {DISPATCH_READER} 写入，{writer} 的写入被拒绝",
+            }
         entry = store.find(MODULE, entry_id)
         if entry is None:
             return {"ok": False, "error": "会话不存在"}
+        dispatch = self._dispatch_view(entry_id) or {}
+        proxy_id = dispatch.get("proxy_id")
+        if not proxy_id:
+            return {
+                "ok": False,
+                "code": "no_dispatch",
+                "message": "该会话尚未取得有效代理调度结果，请求未写入日志",
+                "session_id": entry_id,
+            }
+        authorization = dispatch.get("authorization") or {}
+        if dispatch.get("scope") == "跨域" and not (authorization.get("授权编号") and authorization.get("授权人")):
+            return {
+                "ok": False,
+                "code": "unauthorized_cross_region",
+                "message": "跨域代理缺少授权依据，请求未写入日志",
+                "session_id": entry_id,
+                "proxy_id": proxy_id,
+            }
         try:
             count = int(str(entry.get("请求计数") or "0")) + 1
         except (ValueError, TypeError):
@@ -112,11 +165,31 @@ class SessionMgrService:
         entry["最后活动"] = "2026-11-16T00:00:00Z"
         logs = store.pipeline_state("session_request_logs") or {}
         log = logs.setdefault(str(entry_id), [])
-        log.append({"url": url, "latency": latency_ms, "count": count})
+        log.append({
+            "url": url,
+            "latency": latency_ms,
+            "count": count,
+            "proxy_id": int(proxy_id),
+            "proxy_code": dispatch.get("proxy_code"),
+            "proxy_region": dispatch.get("proxy_region"),
+            "session_region": dispatch.get("region_raw") or dispatch.get("region"),
+            "affiliation_basis": (dispatch.get("affiliation") or {}).get("basis"),
+            "scope": dispatch.get("scope"),
+            "authorization": authorization,
+            "dispatch_version": dispatch.get("version"),
+            "audit_reason": (dispatch.get("audit") or {}).get("reason"),
+        })
         if len(log) > 100:
             logs[str(entry_id)] = log[-100:]
         store.set_pipeline_state("session_request_logs", logs)
-        return {"ok": True, "request_count": count}
+        return {
+            "ok": True,
+            "request_count": count,
+            "proxy_id": int(proxy_id),
+            "proxy_code": dispatch.get("proxy_code"),
+            "affiliation_basis": (dispatch.get("affiliation") or {}).get("basis"),
+            "scope": dispatch.get("scope"),
+        }
 
     def rotate_session(self, source_id: int) -> dict[str, Any] | None:
         """为指定采集源轮替到一个活跃会话。"""

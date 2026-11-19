@@ -391,10 +391,32 @@ def test_data_processing_full_chain() -> None:
 
 def test_monitor_consumes_pipeline_state() -> None:
     """测试采集监控消费其他模块产物。"""
-    # 先写入一些会话请求日志
+    # 先准备带地域归属的源、健康代理和调度结果，再写入会话请求日志
+    src_svc = CrawlSourceService()
+    src, _ = src_svc.create_entry({
+        "源标识": "SRC-MON-001",
+        "源名称": "监控测试源",
+        "协议类型": "https",
+        "基础URL": "https://example.com",
+        "地区归属": "华东-杭州",
+    })
+    proxy_svc = ProxyPoolService()
+    proxy, _ = proxy_svc.create_entry({
+        "节点编号": "PROX-MON-01",
+        "代理地址": "10.0.0.9",
+        "端口号": "8080",
+        "地域标识": "华东-杭州",
+        "响应延迟": "100",
+        "成功率": "99%",
+    })
+    proxy_svc.run_action(proxy["id"], "标记可用")
+
     sess_svc = SessionMgrService()
-    sess, _ = sess_svc.create_entry({"会话编号": "SESS-MON-01", "关联源": "1"})
+    sess, _ = sess_svc.create_entry({"会话编号": "SESS-MON-01", "关联源": src["源标识"]})
     sess_svc.run_action(sess["id"], "标记活跃")
+    dispatch = proxy_svc.dispatch_for_session(sess["id"])
+    assert dispatch["ok"] is True
+    assert dispatch["proxy_id"] == proxy["id"]
     sess_svc.record_request(sess["id"], "https://example.com", 150.0)
     sess_svc.record_request(sess["id"], "https://example.com/2", 200.0)
 
